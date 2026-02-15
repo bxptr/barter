@@ -3,4 +3,5 @@ uvicorn
 pydantic
 httpx
 jsonschema
+mcp
 pytest

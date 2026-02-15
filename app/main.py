@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 from dataclasses import dataclass
+import hashlib
 import html
 import json
 import mimetypes
 import os
 from pathlib import Path
 import re
+import secrets
+import sqlite3
 import sys
 import tempfile
 import time
@@ -244,6 +248,143 @@ def err(
     return JSONResponse(status_code=status, content=errpayload(msg, type=type, param=param, code=code))
 
 
+def autherr() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content=errpayload(
+            "missing or invalid api key",
+            type="authentication_error",
+            code="invalid_api_key",
+        ),
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def bearer(req: Request) -> str | None:
+    h = req.headers.get("authorization") or ""
+    if h.lower().startswith("bearer "):
+        val = h[7:].strip()
+        return val or None
+
+    return None
+
+
+class Keydb:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.con = sqlite3.connect(str(path), check_same_thread=False)
+        self.con.row_factory = sqlite3.Row
+        self._init()
+        try:
+            self.path.chmod(0o600)
+        except Exception:
+            pass
+
+    def _init(self) -> None:
+        cur = self.con.cursor()
+        cur.execute(
+            """
+            create table if not exists keys(
+                id text primary key,
+                name text,
+                hash text not null unique,
+                admin integer not null default 0,
+                created_at integer not null,
+                last_used_at integer,
+                revoked integer not null default 0,
+                revoked_at integer
+            )
+            """
+        )
+        self.con.commit()
+
+    def close(self) -> None:
+        try:
+            self.con.close()
+        except Exception:
+            pass
+
+    def _hash(self, key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def add(self, *, name: str | None = None, admin: bool = False) -> dict[str, Any]:
+        now = int(time.time())
+        kid = f"key_{uuid4().hex}"
+        secret = "brtr-" + secrets.token_urlsafe(32)
+        h = self._hash(secret)
+
+        cur = self.con.cursor()
+        cur.execute(
+            "insert into keys(id,name,hash,admin,created_at) values (?,?,?,?,?)",
+            (kid, name, h, 1 if admin else 0, now),
+        )
+        self.con.commit()
+
+        return {
+            "id": kid,
+            "object": "api_key",
+            "created_at": now,
+            "name": name,
+            "admin": admin,
+            "revoked": False,
+            "key": secret,
+        }
+
+    def check(self, key: str) -> dict[str, Any] | None:
+        if not (key or "").startswith("brtr-"):
+            return None
+
+        h = self._hash(key)
+        cur = self.con.cursor()
+        row = cur.execute(
+            "select id,admin,revoked from keys where hash=?",
+            (h,),
+        ).fetchone()
+
+        if row is None or int(row["revoked"] or 0) != 0:
+            return None
+
+        now = int(time.time())
+        cur.execute("update keys set last_used_at=? where id=?", (now, str(row["id"])))
+        self.con.commit()
+
+        return {"id": str(row["id"]), "admin": bool(row["admin"])}
+
+    def list(self) -> list[dict[str, Any]]:
+        cur = self.con.cursor()
+        rows = cur.execute(
+            "select id,name,admin,created_at,last_used_at,revoked,revoked_at from keys order by created_at desc"
+        ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": str(r["id"]),
+                    "object": "api_key",
+                    "created_at": int(r["created_at"]),
+                    "name": r["name"],
+                    "admin": bool(r["admin"]),
+                    "last_used_at": int(r["last_used_at"]) if r["last_used_at"] is not None else None,
+                    "revoked": bool(r["revoked"]),
+                    "revoked_at": int(r["revoked_at"]) if r["revoked_at"] is not None else None,
+                }
+            )
+
+        return out
+
+    def revoke(self, kid: str) -> bool:
+        now = int(time.time())
+        cur = self.con.cursor()
+        res = cur.execute(
+            "update keys set revoked=1,revoked_at=? where id=? and revoked=0",
+            (now, kid),
+        )
+        self.con.commit()
+        return bool(res.rowcount)
+
+
 class Tools:
     async def web(
         self,
@@ -350,6 +491,118 @@ class Tools:
         finally:
             tmp.cleanup()
 
+    def _mcptransport(self, url: str, transport: str | None) -> str:
+        t = (transport or "").strip().lower()
+        if t in {"sse", "streamable_http", "streamable-http", "http"}:
+            return "sse" if t == "sse" else "streamable_http"
+
+        p = urlparse(url)
+        path = (p.path or "").lower()
+        if path.endswith("/sse") or "/sse/" in path:
+            return "sse"
+        return "streamable_http"
+
+    @contextlib.asynccontextmanager
+    async def _mcp(
+        self, url: str, *, headers: dict[str, str] | None, transport: str | None
+    ):
+        try:
+            from mcp.client.session import ClientSession
+            from mcp.client.sse import sse_client
+            from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+        except Exception as exc:
+            raise RuntimeError(f"mcp not available: {exc}") from exc
+
+        t = self._mcptransport(url, transport)
+        if t == "sse":
+            async with sse_client(url, headers=headers) as (read, write):
+                async with ClientSession(read, write) as sess:
+                    await sess.initialize()
+                    yield sess
+            return
+
+        async with create_mcp_http_client(headers=headers) as client:
+            async with streamable_http_client(url, http_client=client) as (read, write, _getid):
+                async with ClientSession(read, write) as sess:
+                    await sess.initialize()
+                    yield sess
+
+    async def mcptools(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        transport: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        lim = max(1, min(int(limit or 200), 1000))
+        out: list[dict[str, Any]] = []
+
+        async with self._mcp(url, headers=headers, transport=transport) as sess:
+            cur: str | None = None
+            for _ in range(50):
+                res = await sess.list_tools(cursor=cur)
+                for tool in res.tools:
+                    out.append(
+                        {
+                            "name": tool.name,
+                            "description": tool.description or tool.title or "",
+                            "input_schema": tool.inputSchema or {},
+                        }
+                    )
+                    if len(out) >= lim:
+                        return out
+                cur = res.nextCursor
+                if not cur:
+                    break
+
+        return out
+
+    async def mcpcall(
+        self,
+        url: str,
+        name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        transport: str | None = None,
+    ) -> dict[str, Any]:
+        nm = (name or "").strip()
+        if not nm:
+            raise ValueError("mcp tool name is required")
+
+        async with self._mcp(url, headers=headers, transport=transport) as sess:
+            res = await sess.call_tool(nm, arguments=arguments or {})
+
+        if res.structuredContent is not None:
+            raw = json.dumps(res.structuredContent, ensure_ascii=True, separators=(",", ":"))
+            return {"is_error": bool(res.isError), "output": raw}
+
+        texts: list[str] = []
+        other = False
+        dumps: list[dict[str, Any]] = []
+        for item in res.content:
+            try:
+                d = item.model_dump()
+            except Exception:
+                d = {"type": getattr(item, "type", "unknown"), "value": str(item)}
+            dumps.append(d)
+            if d.get("type") == "text" and isinstance(d.get("text"), str):
+                texts.append(d["text"])
+            else:
+                other = True
+
+        if not other and texts:
+            return {"is_error": bool(res.isError), "output": "\n".join(texts).strip()}
+
+        cap = 2000
+        for d in dumps:
+            if isinstance(d.get("data"), str) and len(d["data"]) > cap:
+                d["data"] = d["data"][:cap] + "...(truncated)"
+
+        raw = json.dumps(dumps, ensure_ascii=True, separators=(",", ":"))
+        return {"is_error": bool(res.isError), "output": raw}
+
 
 def _ddgurl(href: str) -> str:
     p = urlparse(href)
@@ -367,6 +620,8 @@ def _canon(typ: str) -> str | None:
     t = (typ or "").strip()
     if not t:
         return None
+    if t == "mcp":
+        return "mcp"
     if t == "code_interpreter":
         return "code_interpreter"
     if t in {"web_search", "web_search_preview"} or t.startswith("web_search_"):
@@ -396,16 +651,76 @@ def toolset(raw: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], dic
         if name is None:
             raise ValueError(f"unsupported tool type '{typ}'")
 
-        defs.append(t)
-
         if name == "web_search":
+            defs.append(t)
             allow = None
             filt = t.get("filters")
             if isinstance(filt, dict) and isinstance(filt.get("allowed_domains"), list):
                 allow = [d for d in filt.get("allowed_domains") if isinstance(d, str)]
             enabled[name] = {"allow": allow}
-        else:
-            enabled[name] = {}
+            continue
+
+        if name == "mcp":
+            label = t.get("server_label")
+            url = t.get("server_url")
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError("mcp tool requires server_label")
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError("mcp tool requires server_url")
+
+            label = label.strip()
+            url = url.strip()
+
+            auth = t.get("authorization") if isinstance(t.get("authorization"), str) and t.get("authorization").strip() else None
+            hdrs = t.get("headers") if isinstance(t.get("headers"), dict) else None
+            headers: dict[str, str] | None = None
+            if hdrs:
+                headers = {str(k): str(v) for k, v in hdrs.items() if isinstance(k, str) and isinstance(v, str)}
+
+            allow = t.get("allowed_tools") if isinstance(t.get("allowed_tools"), list) else None
+            allowed = [x for x in (allow or []) if isinstance(x, str) and x.strip()] or None
+
+            appr = t.get("require_approval")
+            if appr is None:
+                appr = "never"
+            if isinstance(appr, str):
+                appr = appr.strip().lower()
+                if appr not in {"never"}:
+                    raise ValueError("mcp require_approval only supports 'never'")
+            else:
+                raise ValueError("mcp require_approval must be a string")
+
+            desc = t.get("server_description") if isinstance(t.get("server_description"), str) else None
+            transport = t.get("transport") if isinstance(t.get("transport"), str) and t.get("transport").strip() else None
+
+            cfg = enabled.setdefault("mcp", {"servers": {}, "tools": {}})
+            if not isinstance(cfg.get("servers"), dict):
+                cfg["servers"] = {}
+            if not isinstance(cfg.get("tools"), dict):
+                cfg["tools"] = {}
+
+            existing = cfg["servers"].get(label)
+            if existing and existing.get("url") != url:
+                raise ValueError(f"mcp server_label '{label}' already registered with a different server_url")
+
+            cfg["servers"][label] = {
+                "label": label,
+                "url": url,
+                "authorization": auth,
+                "headers": headers,
+                "allowed_tools": allowed,
+                "server_description": desc,
+                "transport": transport,
+            }
+
+            safe = dict(t)
+            safe.pop("authorization", None)
+            safe.pop("headers", None)
+            defs.append(safe)
+            continue
+
+        defs.append(t)
+        enabled[name] = {}
 
     return defs, enabled
 
@@ -428,7 +743,28 @@ def toolchoice(raw: Any | None, enabled: dict[str, dict[str, Any]]) -> Any:
         if isinstance(typ, str):
             name = _canon(typ)
             if name and name in enabled:
-                return {"type": name}
+                if name != "mcp":
+                    return {"type": name}
+
+                sl = raw.get("server_label")
+                nm = raw.get("name") or raw.get("tool_name") or raw.get("tool")
+                if isinstance(raw.get("mcp"), dict):
+                    sl = sl or raw["mcp"].get("server_label")
+                    nm = nm or raw["mcp"].get("name") or raw["mcp"].get("tool_name")
+
+                sl = sl.strip() if isinstance(sl, str) else None
+                nm = nm.strip() if isinstance(nm, str) else None
+
+                out: dict[str, Any] = {"type": "mcp"}
+                if sl:
+                    mcp = enabled.get("mcp") if isinstance(enabled.get("mcp"), dict) else None
+                    servers = mcp.get("servers") if isinstance(mcp, dict) else None
+                    if not isinstance(servers, dict) or sl not in servers:
+                        raise ValueError(f"tool_choice mcp server_label '{sl}' is not enabled")
+                    out["server_label"] = sl
+                if nm:
+                    out["name"] = nm
+                return out
         raise ValueError("tool_choice object must specify an enabled tool type")
 
     raise ValueError("tool_choice must be a string or object")
@@ -465,19 +801,57 @@ def actjson(text: str) -> dict[str, Any] | None:
 def actlead(enabled: dict[str, dict[str, Any]], choice: Any) -> str:
     names = ", ".join(sorted(enabled))
     forced = ""
+    forcedmcp: str | None = None
+    forcedsrv: str | None = None
     if isinstance(choice, dict) and isinstance(choice.get("type"), str):
         forced = choice["type"]
+        if forced == "mcp":
+            forcedsrv = choice.get("server_label") if isinstance(choice.get("server_label"), str) else None
+            forcedmcp = choice.get("name") if isinstance(choice.get("name"), str) else None
     if choice == "required":
         forced = names or ""
 
     must = f" You must call {forced}." if forced else ""
+    if forced == "mcp" and (forcedsrv or forcedmcp):
+        must = " You must call mcp"
+        if forcedsrv:
+            must += f" server_label={forcedsrv}"
+        if forcedmcp:
+            must += f" name={forcedmcp}"
+        must += "."
+
+    mcpinfo = ""
+    mcp = enabled.get("mcp") if isinstance(enabled.get("mcp"), dict) else None
+    if mcp and isinstance(mcp.get("servers"), dict) and isinstance(mcp.get("tools"), dict):
+        lines: list[str] = []
+        for label, cfg in sorted(mcp["servers"].items()):
+            if not isinstance(cfg, dict):
+                continue
+            url = cfg.get("url")
+            url = url if isinstance(url, str) else ""
+            lines.append(f"- {label}: {url}".strip())
+            tlist = mcp["tools"].get(label)
+            if isinstance(tlist, list) and tlist:
+                for tool in tlist[:50]:
+                    if not isinstance(tool, dict):
+                        continue
+                    nm = tool.get("name")
+                    desc = tool.get("description") or ""
+                    if isinstance(nm, str) and nm.strip():
+                        descs = str(desc)[:200].replace("\n", " ")
+                        lines.append(f"  * {nm.strip()}: {descs}".rstrip())
+        if lines:
+            mcpinfo = "MCP servers and tools:\n" + "\n".join(lines) + "\n"
+
     return (
         "TOOL MODE. Decide the next step for the assistant.\n"
         f"Allowed tools: {names or 'none'}.{must}\n"
+        f"{mcpinfo}"
         "Output exactly one JSON object and nothing else.\n"
         "To call a tool:\n"
         '  {"type":"tool","name":"web_search","arguments":{"query":"...","max_results":5}}\n'
         '  {"type":"tool","name":"code_interpreter","arguments":{"code":"..."}}\n'
+        '  {"type":"tool","name":"mcp","arguments":{"server_label":"...","name":"...","arguments":{}}}\n'
         "To finish:\n"
         '  {"type":"final","text":"..."}'
     )
@@ -584,6 +958,95 @@ async def dotool(
             "outputs": outputs,
         }
         msg = toolmsg("code_interpreter", {"code": code, **run})
+        return item, msg
+
+    if name == "mcp":
+        tid = tid or f"mcp_{uuid4().hex}"
+        sl = args.get("server_label") or args.get("server") or args.get("label")
+        sl = sl.strip() if isinstance(sl, str) and sl.strip() else None
+        nm = args.get("name") or args.get("tool") or args.get("tool_name")
+        nm = nm.strip() if isinstance(nm, str) and nm.strip() else None
+
+        targs = args.get("arguments") or args.get("args") or {}
+        if isinstance(targs, str):
+            try:
+                targs = json.loads(targs)
+            except json.JSONDecodeError:
+                targs = {}
+        if targs is None:
+            targs = {}
+        if not isinstance(targs, dict):
+            targs = {}
+
+        mcp = opts.get("mcp") if isinstance(opts.get("mcp"), dict) else None
+        srv = mcp.get("servers", {}).get(sl) if mcp and sl else None
+        if not isinstance(srv, dict):
+            item = {
+                "id": tid,
+                "type": "mcp_call",
+                "server_label": sl or "",
+                "name": nm or "",
+                "arguments": json.dumps(targs, ensure_ascii=True, separators=(",", ":")),
+                "output": "",
+                "error": {"message": "unknown mcp server_label"},
+            }
+            msg = toolmsg("mcp", {"error": "unknown mcp server_label", "server_label": sl, "name": nm})
+            return item, msg
+
+        allowed = srv.get("allowed_tools")
+        if isinstance(allowed, list) and nm and nm not in allowed:
+            item = {
+                "id": tid,
+                "type": "mcp_call",
+                "server_label": sl or "",
+                "name": nm or "",
+                "arguments": json.dumps(targs, ensure_ascii=True, separators=(",", ":")),
+                "output": "",
+                "error": {"message": f"mcp tool '{nm}' is not allowed"},
+            }
+            msg = toolmsg("mcp", {"error": f"tool '{nm}' is not allowed", "server_label": sl, "name": nm})
+            return item, msg
+
+        url = srv.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("mcp server url missing")
+
+        headers: dict[str, str] = {}
+        if isinstance(srv.get("headers"), dict):
+            headers.update({str(k): str(v) for k, v in srv["headers"].items()})
+        auth = srv.get("authorization")
+        if isinstance(auth, str) and auth.strip() and "authorization" not in {k.lower() for k in headers}:
+            val = auth.strip()
+            headers["Authorization"] = val if " " in val else f"Bearer {val}"
+
+        run = await t.mcpcall(
+            url,
+            nm or "",
+            arguments=targs,
+            headers=headers or None,
+            transport=srv.get("transport") if isinstance(srv.get("transport"), str) else None,
+        )
+        out = str(run.get("output") or "")
+        item = {
+            "id": tid,
+            "type": "mcp_call",
+            "server_label": sl or "",
+            "name": nm or "",
+            "arguments": json.dumps(targs, ensure_ascii=True, separators=(",", ":")),
+            "output": out,
+        }
+        if run.get("is_error"):
+            item["error"] = {"message": out or "mcp tool error"}
+        msg = toolmsg(
+            "mcp",
+            {
+                "server_label": sl,
+                "name": nm,
+                "arguments": targs,
+                "output": out,
+                "is_error": bool(run.get("is_error")),
+            },
+        )
         return item, msg
 
     raise ValueError(f"unsupported tool '{name}'")
@@ -756,17 +1219,112 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
     codex = codex or Codex(bin=cfg.bin, cwd=cfg.cwd, timeout=cfg.timeout)
     tools = tools or Tools()
 
-    app = FastAPI()
+    dbp = Path(os.getenv("BARTER_DB", str(cfg.cwd / "barter.db"))).expanduser().resolve()
+    admin = os.getenv("BARTER_ADMIN_KEY", "").strip()
+    if admin and not admin.startswith("brtr-"):
+        raise RuntimeError("BARTER_ADMIN_KEY must start with 'brtr-'")
+    keydb = Keydb(dbp)
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
     app.state.cfg = cfg
     app.state.codex = codex
     app.state.tools = tools
+    app.state.keydb = keydb
+    app.state.admin = admin
     app.state.store: dict[str, dict[str, Any]] = {}
     app.state.items: dict[str, list[dict[str, Any]]] = {}
+
+    @app.on_event("shutdown")
+    def _shutdown() -> None:
+        try:
+            request_keydb = getattr(app.state, "keydb", None)
+            if request_keydb:
+                request_keydb.close()
+        except Exception:
+            pass
+
+    @app.middleware("http")
+    async def _auth(req: Request, call_next):
+        path = req.url.path or "/"
+        if path == "/healthz":
+            return await call_next(req)
+        if req.method == "OPTIONS":
+            return await call_next(req)
+
+        key = bearer(req)
+        if not key:
+            return autherr()
+
+        if admin and secrets.compare_digest(key, admin):
+            req.state.keyid = "admin"
+            req.state.admin = True
+            return await call_next(req)
+
+        rec = req.app.state.keydb.check(key)
+        if not rec:
+            return autherr()
+
+        req.state.keyid = rec["id"]
+        req.state.admin = bool(rec.get("admin"))
+        return await call_next(req)
 
     @app.get("/healthz")
     async def health() -> JSONResponse:
         return JSONResponse({"status": "ok"})
+
+    @app.post("/v1/keys")
+    async def mkkey(request: Request):
+        if not bool(getattr(request.state, "admin", False)):
+            return err(
+                403,
+                "admin key required",
+                type="permission_error",
+                code="insufficient_permissions",
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        name = body.get("name") if isinstance(body, dict) else None
+        name = name.strip() if isinstance(name, str) and name.strip() else None
+        admin = bool(body.get("admin")) if isinstance(body, dict) and body.get("admin") is not None else False
+
+        try:
+            out = request.app.state.keydb.add(name=name, admin=admin)
+        except Exception as exc:
+            return err(502, f"key db failed: {exc}", type="server_error", code="db_error")
+
+        return JSONResponse(out)
+
+    @app.get("/v1/keys")
+    async def lskeys(request: Request):
+        if not bool(getattr(request.state, "admin", False)):
+            return err(
+                403,
+                "admin key required",
+                type="permission_error",
+                code="insufficient_permissions",
+            )
+
+        return JSONResponse({"object": "list", "data": request.app.state.keydb.list()})
+
+    @app.delete("/v1/keys/{kid}")
+    async def delkey(kid: str, request: Request):
+        if not bool(getattr(request.state, "admin", False)):
+            return err(
+                403,
+                "admin key required",
+                type="permission_error",
+                code="insufficient_permissions",
+            )
+
+        ok = request.app.state.keydb.revoke(kid)
+        if not ok:
+            return err(404, f"key '{kid}' not found", param="kid", code="not_found")
+        return JSONResponse({"id": kid, "object": "api_key", "deleted": True})
 
     @app.get("/v1/models")
     async def models() -> JSONResponse:
@@ -1089,6 +1647,8 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                 outs: list[dict[str, Any]] = []
                 called = 0
                 forced = tchoice.get("type") if isinstance(tchoice, dict) else None
+                forcedsrv = tchoice.get("server_label") if isinstance(tchoice, dict) else None
+                forcedmcp = tchoice.get("name") if isinstance(tchoice, dict) else None
 
                 try:
                     base = {
@@ -1113,6 +1673,66 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                     }
                     yield sseevt("response.created", {"response": base})
                     yield sseevt("response.in_progress", {"response": base})
+
+                    mcp = topts.get("mcp") if isinstance(topts.get("mcp"), dict) else None
+                    if mcp and isinstance(mcp.get("servers"), dict):
+                        for label, srv in sorted(mcp["servers"].items()):
+                            if not isinstance(srv, dict):
+                                continue
+                            url = srv.get("url")
+                            if not isinstance(url, str) or not url.strip():
+                                continue
+
+                            headers: dict[str, str] = {}
+                            if isinstance(srv.get("headers"), dict):
+                                headers.update({str(k): str(v) for k, v in srv["headers"].items()})
+                            auth = srv.get("authorization")
+                            if isinstance(auth, str) and auth.strip() and "authorization" not in {
+                                k.lower() for k in headers
+                            }:
+                                val = auth.strip()
+                                headers["Authorization"] = val if " " in val else f"Bearer {val}"
+
+                            outidx = len(outs)
+                            tid = f"mcp_tools_{uuid4().hex}"
+                            try:
+                                tools = await t.mcptools(
+                                    url,
+                                    headers=headers or None,
+                                    transport=srv.get("transport") if isinstance(srv.get("transport"), str) else None,
+                                )
+                                allow = srv.get("allowed_tools")
+                                if isinstance(allow, list):
+                                    allowset = {str(x) for x in allow}
+                                    tools = [x for x in tools if isinstance(x, dict) and x.get("name") in allowset]
+                                if isinstance(mcp.get("tools"), dict):
+                                    mcp["tools"][label] = tools
+                                item = {
+                                    "id": tid,
+                                    "type": "mcp_list_tools",
+                                    "server_label": label,
+                                    "tools": tools,
+                                }
+                            except Exception as exc:
+                                if isinstance(mcp.get("tools"), dict):
+                                    mcp["tools"][label] = []
+                                item = {
+                                    "id": tid,
+                                    "type": "mcp_list_tools",
+                                    "server_label": label,
+                                    "tools": [],
+                                    "error": {"message": str(exc)},
+                                }
+
+                            outs.append(item)
+                            yield sseevt(
+                                "response.output_item.added",
+                                {"response_id": rid, "output_index": outidx, "item": item},
+                            )
+                            yield sseevt(
+                                "response.output_item.done",
+                                {"response_id": rid, "output_index": outidx, "item": item},
+                            )
 
                     for _ in range(8):
                         lead = actlead(topts, tchoice)
@@ -1144,12 +1764,33 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                             msgs2.append(Msg(role="user", content=f"You must call {forced} tool first."))
                             continue
 
+                        if forced == "mcp" and called == 0:
+                            asl = (args or {}).get("server_label")
+                            anm = (args or {}).get("name") or (args or {}).get("tool") or (args or {}).get("tool_name")
+                            asl = asl.strip() if isinstance(asl, str) else None
+                            anm = anm.strip() if isinstance(anm, str) else None
+                            if forcedsrv and asl and asl != forcedsrv:
+                                msgs2.append(Msg(role="user", content=f"You must call mcp server_label={forcedsrv} first."))
+                                continue
+                            if forcedmcp and anm and anm != forcedmcp:
+                                msgs2.append(Msg(role="user", content=f"You must call mcp name={forcedmcp} first."))
+                                continue
+
                         outidx = len(outs)
-                        tid = ("ws_" if name == "web_search" else "ci_") + uuid4().hex
+                        tid = (
+                            ("ws_" if name == "web_search" else "ci_" if name == "code_interpreter" else "mcp_")
+                            + uuid4().hex
+                        )
 
                         start: dict[str, Any] = {
                             "id": tid,
-                            "type": "web_search_call" if name == "web_search" else "code_interpreter_call",
+                            "type": (
+                                "web_search_call"
+                                if name == "web_search"
+                                else "code_interpreter_call"
+                                if name == "code_interpreter"
+                                else "mcp_call"
+                            ),
                             "status": "in_progress",
                         }
                         if name == "web_search":
@@ -1160,6 +1801,11 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                             start["code"] = c if isinstance(c, str) else str(c)
                             start["container_id"] = "local"
                             start["outputs"] = []
+                        if name == "mcp":
+                            sl = (args or {}).get("server_label") or ""
+                            nm = (args or {}).get("name") or (args or {}).get("tool") or ""
+                            start["server_label"] = sl if isinstance(sl, str) else str(sl)
+                            start["name"] = nm if isinstance(nm, str) else str(nm)
 
                         yield sseevt(
                             "response.output_item.added",
@@ -1175,7 +1821,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                                 "response.web_search_call.searching",
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
                             )
-                        else:
+                        elif name == "code_interpreter":
                             yield sseevt(
                                 "response.code_interpreter_call.in_progress",
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
@@ -1195,7 +1841,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                                 "response.web_search_call.completed",
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
                             )
-                        else:
+                        elif name == "code_interpreter":
                             yield sseevt(
                                 "response.code_interpreter_call.completed",
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
@@ -1603,9 +2249,61 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
             outs: list[dict[str, Any]] = []
             called = 0
             forced = tchoice.get("type") if isinstance(tchoice, dict) else None
+            forcedsrv = tchoice.get("server_label") if isinstance(tchoice, dict) else None
+            forcedmcp = tchoice.get("name") if isinstance(tchoice, dict) else None
             use: Usage | None = None
 
             try:
+                mcp = topts.get("mcp") if isinstance(topts.get("mcp"), dict) else None
+                if mcp and isinstance(mcp.get("servers"), dict):
+                    for label, srv in sorted(mcp["servers"].items()):
+                        if not isinstance(srv, dict):
+                            continue
+                        url = srv.get("url")
+                        if not isinstance(url, str) or not url.strip():
+                            continue
+
+                        headers: dict[str, str] = {}
+                        if isinstance(srv.get("headers"), dict):
+                            headers.update({str(k): str(v) for k, v in srv["headers"].items()})
+                        auth = srv.get("authorization")
+                        if isinstance(auth, str) and auth.strip() and "authorization" not in {
+                            k.lower() for k in headers
+                        }:
+                            val = auth.strip()
+                            headers["Authorization"] = val if " " in val else f"Bearer {val}"
+
+                        tid = f"mcp_tools_{uuid4().hex}"
+                        try:
+                            tools = await t.mcptools(
+                                url,
+                                headers=headers or None,
+                                transport=srv.get("transport") if isinstance(srv.get("transport"), str) else None,
+                            )
+                            allow = srv.get("allowed_tools")
+                            if isinstance(allow, list):
+                                allowset = {str(x) for x in allow}
+                                tools = [x for x in tools if isinstance(x, dict) and x.get("name") in allowset]
+                            if isinstance(mcp.get("tools"), dict):
+                                mcp["tools"][label] = tools
+                            item = {
+                                "id": tid,
+                                "type": "mcp_list_tools",
+                                "server_label": label,
+                                "tools": tools,
+                            }
+                        except Exception as exc:
+                            if isinstance(mcp.get("tools"), dict):
+                                mcp["tools"][label] = []
+                            item = {
+                                "id": tid,
+                                "type": "mcp_list_tools",
+                                "server_label": label,
+                                "tools": [],
+                                "error": {"message": str(exc)},
+                            }
+                        outs.append(item)
+
                 for _ in range(8):
                     lead = actlead(topts, tchoice)
                     prompt, paths = await mkprompt(msgs2, system=sysm, imgs=imgs, lead=lead)
@@ -1631,6 +2329,18 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                     if forced and called == 0 and name != forced:
                         msgs2.append(Msg(role="user", content=f"You must call {forced} tool first."))
                         continue
+
+                    if forced == "mcp" and called == 0:
+                        asl = (args or {}).get("server_label")
+                        anm = (args or {}).get("name") or (args or {}).get("tool") or (args or {}).get("tool_name")
+                        asl = asl.strip() if isinstance(asl, str) else None
+                        anm = anm.strip() if isinstance(anm, str) else None
+                        if forcedsrv and asl and asl != forcedsrv:
+                            msgs2.append(Msg(role="user", content=f"You must call mcp server_label={forcedsrv} first."))
+                            continue
+                        if forcedmcp and anm and anm != forcedmcp:
+                            msgs2.append(Msg(role="user", content=f"You must call mcp name={forcedmcp} first."))
+                            continue
 
                     item, msg = await dotool(t, name, args or {}, topts)
                     outs.append(item)
