@@ -170,6 +170,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         return JSONResponse({"id": kid, "object": "api_key", "deleted": True})
 
     @app.get("/v1/models")
+    @app.get("/models")
     async def models() -> JSONResponse:
         now = int(time.time())
         return JSONResponse(
@@ -180,6 +181,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         )
 
     @app.post("/v1/chat/completions")
+    @app.post("/chat/completions")
     async def chat(body: Chatreq, request: Request):
         cdx = request.app.state.codex
 
@@ -400,6 +402,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         )
 
     @app.post("/v1/responses")
+    @app.post("/responses")
     async def responses(body: Respreq, request: Request):
         cdx = request.app.state.codex
 
@@ -1277,6 +1280,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         return JSONResponse(resp)
 
     @app.post("/v1/responses/input_tokens")
+    @app.post("/responses/input_tokens")
     async def inputtokens(request: Request):
         try:
             body = await request.json()
@@ -1323,6 +1327,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         return JSONResponse({"object": "response.input_tokens", "input_tokens": count})
 
     @app.post("/v1/responses/compact")
+    @app.post("/responses/compact")
     async def compact(request: Request):
         try:
             body = await request.json()
@@ -1397,6 +1402,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         )
 
     @app.get("/v1/responses/{rid}")
+    @app.get("/responses/{rid}")
     async def getresp(rid: str, request: Request):
         got = request.app.state.store.get(rid)
         if got is None:
@@ -1404,6 +1410,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         return JSONResponse(got)
 
     @app.get("/v1/responses/{rid}/input_items")
+    @app.get("/responses/{rid}/input_items")
     async def getitems(rid: str, request: Request):
         if rid not in request.app.state.store:
             return err(404, f"response '{rid}' not found", param="response_id", code="not_found")
@@ -1420,12 +1427,14 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         )
 
     @app.post("/v1/responses/{rid}/cancel")
+    @app.post("/responses/{rid}/cancel")
     async def cancel(rid: str, request: Request):
         if rid not in request.app.state.store:
             return err(404, f"response '{rid}' not found", param="response_id", code="not_found")
         return err(409, "cancel is not supported", code="not_supported")
 
     @app.delete("/v1/responses/{rid}")
+    @app.delete("/responses/{rid}")
     async def delresp(rid: str, request: Request):
         if rid not in request.app.state.store:
             return err(404, f"response '{rid}' not found", param="response_id", code="not_found")
