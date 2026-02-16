@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -48,10 +49,19 @@ class Codex:
         bin: str = "codex",
         cwd: Path,
         timeout: int = 900,
+        disable_shell_tool: bool | None = None,
     ) -> None:
         self.bin = bin
         self.cwd = cwd
         self.timeout = timeout
+        if disable_shell_tool is None:
+            disable_shell_tool = (os.getenv("BARTER_CODEX_DISABLE_SHELL_TOOL", "") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.disable_shell_tool = bool(disable_shell_tool)
         self._flags = _flags(bin)
 
     async def run(self, call: Call) -> Result:
@@ -140,6 +150,9 @@ class Codex:
             "--sandbox",
             "read-only",
         ]
+
+        if self.disable_shell_tool and "--disable" in self._flags:
+            cmd.extend(["--disable", "shell_tool"])
 
         if "--cd" in self._flags:
             cmd.extend(["--cd", str(self.cwd)])

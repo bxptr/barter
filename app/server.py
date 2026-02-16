@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.actions import actlead, actparse, dotool, toolchoice, toolset, useadd
 from app.auth import bearer
 from app.codex import Call, Codex, CodexError, Result, Usage
-from app.config import Cfg, EFFORTS, MODELS, SYSTEM, defeff
+from app.config import Cfg, EFFORTS, MODELS, SYSTEM, ToolCallLimits, defeff
 from app.errors import autherr, err, errpayload
 from app.format import BASELEAD, fmtcanon, fmtlead, gen, split
 from app.images import ImgErr, Tmpimgs
@@ -57,16 +57,33 @@ def _system(extra: str | None) -> str:
     return f"{SYSTEM}\n\nAdditional instructions:\n{extra.strip()}"
 
 
-def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = None) -> FastAPI:
+def mkapp(
+    cfg: Cfg | None = None,
+    codex: Any | None = None,
+    tools: Any | None = None,
+    *,
+    db_path: Path | None = None,
+    admin_key: str | None = None,
+    default_effort: str | None = None,
+    tool_limits: ToolCallLimits | None = None,
+) -> FastAPI:
     cfg = cfg or Cfg.env()
     codex = codex or Codex(bin=cfg.bin, cwd=cfg.cwd, timeout=cfg.timeout)
     tools = tools or Tools()
 
-    dbp = Path(os.getenv("BARTER_DB", str(cfg.cwd / "barter.db"))).expanduser().resolve()
-    admin = os.getenv("BARTER_ADMIN_KEY", "").strip()
+    dbp = (db_path or Path(os.getenv("BARTER_DB", str(cfg.cwd / "barter.db")))).expanduser().resolve()
+    admin = (admin_key if admin_key is not None else os.getenv("BARTER_ADMIN_KEY", "")).strip()
     if admin and not admin.startswith("brtr-"):
         raise RuntimeError("BARTER_ADMIN_KEY must start with 'brtr-'")
     keydb = Keydb(dbp)
+
+    deff = (default_effort if default_effort is not None else os.getenv("BARTER_DEFAULT_EFFORT", "medium")).strip().lower()
+    if not deff:
+        deff = "medium"
+    if deff not in EFFORTS:
+        raise RuntimeError(f"BARTER_DEFAULT_EFFORT must be one of: {', '.join(EFFORTS)}")
+
+    limits = tool_limits or ToolCallLimits.env()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -75,6 +92,8 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
     app.state.tools = tools
     app.state.keydb = keydb
     app.state.admin = admin
+    app.state.default_effort = deff
+    app.state.tool_limits = limits
     app.state.store: dict[str, dict[str, Any]] = {}
     app.state.items: dict[str, list[dict[str, Any]]] = {}
 
@@ -189,7 +208,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         if bad:
             return bad
 
-        effort = defeff(body.reasoning_effort)
+        effort = defeff(body.reasoning_effort, default=request.app.state.default_effort)
         bad = chkeff(effort, param="reasoning_effort")
         if bad:
             return bad
@@ -413,7 +432,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
         if body.background:
             return err(400, "background is not supported", param="background", code="not_supported")
 
-        effort = defeff(body.reasoning.effort if body.reasoning else None)
+        effort = defeff(body.reasoning.effort if body.reasoning else None, default=request.app.state.default_effort)
         bad = chkeff(effort, param="reasoning.effort")
         if bad:
             return bad
@@ -448,6 +467,18 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
             return err(400, f"invalid tool_choice: {exc}", param="tool_choice", code="invalid_tool_choice")
 
         toolon = bool(topts) and tchoice != "none"
+        if toolon:
+            max_calls = request.app.state.tool_limits.max_calls_for(effort)
+            if isinstance(max_calls, int) and max_calls <= 0:
+                forced = tchoice.get("type") if isinstance(tchoice, dict) else None
+                if tchoice == "required" or forced:
+                    return err(
+                        400,
+                        "tool use is required but tool-call limit is 0",
+                        param="tool_choice",
+                        code="tool_budget_exceeded",
+                    )
+                toolon = False
         sysm = _system(body.instructions)
 
         fmt: dict[str, Any] | None = None
@@ -575,7 +606,14 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                                 {"response_id": rid, "output_index": outidx, "item": item},
                             )
 
-                    for _ in range(8):
+                    max_calls = request.app.state.tool_limits.max_calls_for(effort)
+                    bad_turns = 0
+                    while True:
+                        if max_calls is not None and called >= max_calls:
+                            break
+                        if bad_turns >= request.app.state.tool_limits.max_bad_tool_turns:
+                            break
+
                         lead = actlead(topts, tchoice)
                         prompt, paths = await mkprompt(msgs2, system=sysm, imgs=imgs, lead=lead)
                         res = await cdx.run(Call(model=body.model, prompt=prompt, imgs=paths, effort=effort))
@@ -590,18 +628,22 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                                         content="Tool use is required. Call a tool before finishing.",
                                     )
                                 )
+                                bad_turns += 1
                                 continue
                             break
 
                         if not name:
                             msgs2.append(Msg(role="user", content="Tool name missing."))
+                            bad_turns += 1
                             continue
                         if name not in topts:
                             msgs2.append(Msg(role="user", content=f"Tool '{name}' is not enabled."))
+                            bad_turns += 1
                             continue
 
                         if forced and called == 0 and name != forced:
                             msgs2.append(Msg(role="user", content=f"You must call {forced} tool first."))
+                            bad_turns += 1
                             continue
 
                         if forced == "mcp" and called == 0:
@@ -611,9 +653,11 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                             anm = anm.strip() if isinstance(anm, str) else None
                             if forcedsrv and asl and asl != forcedsrv:
                                 msgs2.append(Msg(role="user", content=f"You must call mcp server_label={forcedsrv} first."))
+                                bad_turns += 1
                                 continue
                         if forcedmcp and anm and anm != forcedmcp:
                             msgs2.append(Msg(role="user", content=f"You must call mcp name={forcedmcp} first."))
+                            bad_turns += 1
                             continue
 
                         outidx = len(outs)
@@ -684,6 +728,7 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                         outs.append(item)
                         msgs2.append(msg)
                         called += 1
+                        bad_turns = 0
 
                         if name == "web_search":
                             yield ev(
@@ -1150,7 +1195,14 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                             item = {"id": tid, "type": "mcp_list_tools", "server_label": label, "tools": [], "error": str(exc)}
                         outs.append(item)
 
-                for _ in range(8):
+                max_calls = request.app.state.tool_limits.max_calls_for(effort)
+                bad_turns = 0
+                while True:
+                    if max_calls is not None and called >= max_calls:
+                        break
+                    if bad_turns >= request.app.state.tool_limits.max_bad_tool_turns:
+                        break
+
                     lead = actlead(topts, tchoice)
                     prompt, paths = await mkprompt(msgs2, system=sysm, imgs=imgs, lead=lead)
                     res: Result = await cdx.run(Call(model=body.model, prompt=prompt, imgs=paths, effort=effort))
@@ -1160,15 +1212,18 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                     if typ == "final":
                         if (tchoice == "required" or forced) and called == 0:
                             msgs2.append(Msg(role="user", content="Tool use is required. Call a tool before finishing."))
+                            bad_turns += 1
                             continue
                         break
 
                     if not name or name not in topts:
                         msgs2.append(Msg(role="user", content=f"Tool '{name or ''}' is not enabled."))
+                        bad_turns += 1
                         continue
 
                     if forced and called == 0 and name != forced:
                         msgs2.append(Msg(role="user", content=f"You must call {forced} tool first."))
+                        bad_turns += 1
                         continue
 
                     if forced == "mcp" and called == 0:
@@ -1178,15 +1233,18 @@ def mkapp(cfg: Cfg | None = None, codex: Any | None = None, tools: Any | None = 
                         anm = anm.strip() if isinstance(anm, str) else None
                         if forcedsrv and asl and asl != forcedsrv:
                             msgs2.append(Msg(role="user", content=f"You must call mcp server_label={forcedsrv} first."))
+                            bad_turns += 1
                             continue
                         if forcedmcp and anm and anm != forcedmcp:
                             msgs2.append(Msg(role="user", content=f"You must call mcp name={forcedmcp} first."))
+                            bad_turns += 1
                             continue
 
                     item, msg = await dotool(t, name, args or {}, topts)
                     outs.append(item)
                     msgs2.append(msg)
                     called += 1
+                    bad_turns = 0
 
                 text, use2 = await gen(
                     cdx,
