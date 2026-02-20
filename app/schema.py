@@ -77,6 +77,7 @@ class Respreq(BaseModel):
     background: bool | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
+    max_tool_calls: int | None = None
     text: dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
 
@@ -84,4 +85,3 @@ class Respreq(BaseModel):
     top_p: float | None = None
 
     model_config = ConfigDict(extra="allow")
-

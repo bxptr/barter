@@ -47,11 +47,7 @@ def toolset(raw: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], dic
 
         if name == "web_search":
             defs.append(t)
-            allow = None
-            filt = t.get("filters")
-            if isinstance(filt, dict) and isinstance(filt.get("allowed_domains"), list):
-                allow = [d for d in filt.get("allowed_domains") if isinstance(d, str)]
-            enabled[name] = {"allow": allow}
+            enabled[name] = {}
             continue
 
         if name == "mcp":
@@ -239,11 +235,11 @@ def actlead(enabled: dict[str, dict[str, Any]], choice: Any) -> str:
 
     return (
         "TOOL MODE. Decide the next step for the assistant.\n"
+        "Filesystem access is read-only in this environment.\n"
         f"Allowed tools: {names or 'none'}.{must}\n"
         f"{mcpinfo}"
         "Output exactly one JSON object and nothing else.\n"
         "To call a tool:\n"
-        '  {"type":"tool","name":"web_search","arguments":{"query":"...","max_results":5}}\n'
         '  {"type":"tool","name":"code_interpreter","arguments":{"code":"..."}}\n'
         '  {"type":"tool","name":"mcp","arguments":{"server_label":"...","name":"...","arguments":{}}}\n'
         "To finish:\n"
@@ -304,36 +300,6 @@ async def dotool(
     opts: dict[str, dict[str, Any]],
     tid: str | None = None,
 ) -> tuple[dict[str, Any], Msg]:
-    if name == "web_search":
-        tid = tid or f"ws_{uuid4().hex}"
-        q = args.get("query") or args.get("q") or ""
-        q = q if isinstance(q, str) else str(q)
-        maxres = args.get("max_results") or args.get("maxres") or 5
-        try:
-            results = await t.web(q, maxres=int(maxres), allow=opts.get("web_search", {}).get("allow"))
-            item = {
-                "id": tid,
-                "type": "web_search_call",
-                "status": "completed",
-                "action": {"type": "search", "query": q, "queries": [q]},
-                "query": q,
-                "results": results,
-            }
-            msg = toolmsg("web_search", {"query": q, "results": results})
-            return item, msg
-        except Exception as exc:
-            item = {
-                "id": tid,
-                "type": "web_search_call",
-                "status": "failed",
-                "action": {"type": "search", "query": q, "queries": [q]},
-                "query": q,
-                "error": str(exc),
-                "results": [],
-            }
-            msg = toolmsg("web_search", {"query": q, "error": str(exc), "results": []})
-            return item, msg
-
     if name == "code_interpreter":
         tid = tid or f"ci_{uuid4().hex}"
         code = args.get("code") or args.get("python") or ""
@@ -449,4 +415,3 @@ async def dotool(
         return item, msg
 
     raise ValueError(f"unsupported tool '{name}'")
-

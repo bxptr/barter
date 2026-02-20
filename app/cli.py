@@ -7,18 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from app.codex import Codex
-from app.config import Cfg, EFFORTS, ToolCallLimits
+from app.config import Cfg, EFFORTS
 from app.server import mkapp
 from app.tools import Tools
-
-
-def _int_or_none(raw: str) -> int | None:
-    s = (raw or "").strip().lower()
-    if not s:
-        return None
-    if s in {"none", "null", "unlimited", "inf", "infinite"}:
-        return None
-    return int(s)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -56,25 +47,6 @@ def _mkparser() -> argparse.ArgumentParser:
     serve.add_argument("--admin-key", default=os.getenv("BARTER_ADMIN_KEY", ""))
     serve.add_argument("--db", dest="db_path", default=os.getenv("BARTER_DB", ""))
     serve.add_argument("--default-effort", choices=EFFORTS, default=os.getenv("BARTER_DEFAULT_EFFORT", "medium"))
-
-    serve.add_argument(
-        "--tool-call-cutoff-effort",
-        choices=EFFORTS,
-        default=os.getenv("BARTER_TOOL_CALL_CUTOFF_EFFORT", "medium"),
-        help="Efforts strictly above this cutoff use the 'above cutoff' tool-call limit (default: unlimited).",
-    )
-    serve.add_argument(
-        "--tool-call-limit",
-        type=_int_or_none,
-        default=_int_or_none(os.getenv("BARTER_TOOL_CALL_LIMIT", "5")),
-        help="Max tool calls at or below the cutoff effort. Use 'unlimited' for no limit.",
-    )
-    serve.add_argument(
-        "--tool-call-limit-above-cutoff",
-        type=_int_or_none,
-        default=_int_or_none(os.getenv("BARTER_TOOL_CALL_LIMIT_ABOVE_CUTOFF", "")),
-        help="Max tool calls strictly above the cutoff effort. Default: unlimited.",
-    )
     serve.add_argument(
         "--tool-call-max-bad-turns",
         type=int,
@@ -123,13 +95,6 @@ def _serve(args: Any) -> int:
         disable_shell_tool=disable_shell_tool,
     )
 
-    limits = ToolCallLimits(
-        cutoff_effort=str(args.tool_call_cutoff_effort).strip().lower(),
-        max_calls_at_or_below_cutoff=args.tool_call_limit,
-        max_calls_above_cutoff=args.tool_call_limit_above_cutoff,
-        max_bad_tool_turns=max(0, int(args.tool_call_max_bad_turns)),
-    )
-
     app = mkapp(
         cfg=cfg,
         codex=codex,
@@ -137,7 +102,7 @@ def _serve(args: Any) -> int:
         db_path=db_path,
         admin_key=admin_key or None,
         default_effort=str(args.default_effort),
-        tool_limits=limits,
+        max_bad_tool_turns=max(0, int(args.tool_call_max_bad_turns)),
     )
 
     uvicorn.run(

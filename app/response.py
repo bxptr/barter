@@ -17,6 +17,7 @@ def mkresp(
     meta: dict[str, Any] | None,
     maxout: int | None,
     status: str,
+    max_tool_calls: int | None = None,
     outs: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any | None = None,
@@ -40,6 +41,7 @@ def mkresp(
         "incomplete_details": None,
         "instructions": instr,
         "max_output_tokens": maxout,
+        "max_tool_calls": max_tool_calls,
         "model": model,
         "output": out,
         "output_text": text,
@@ -69,4 +71,3 @@ def respusage(u: Usage | None) -> dict[str, Any] | None:
         "output_tokens_details": {"reasoning_tokens": None},
         "total_tokens": u.total,
     }
-

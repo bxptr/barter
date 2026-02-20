@@ -143,6 +143,7 @@ class Codex:
     def _cmd(self, call: Call) -> list[str]:
         cmd = [
             self.bin,
+            "--search",
             "exec",
             "--json",
             "--model",
@@ -160,6 +161,9 @@ class Codex:
             cmd.append("--skip-git-repo-check")
         if "--ephemeral" in self._flags:
             cmd.append("--ephemeral")
+
+        # Force native Codex web search mode to live.
+        cmd.extend(["-c", 'web_search="live"'])
 
         if call.effort:
             cmd.extend(["-c", f'model_reasoning_effort="{call.effort}"'])

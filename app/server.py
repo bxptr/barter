@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.actions import actlead, actparse, dotool, toolchoice, toolset, useadd
 from app.auth import bearer
 from app.codex import Call, Codex, CodexError, Result, Usage
-from app.config import Cfg, EFFORTS, MODEL_ALIASES, MODELS, SYSTEM, ToolCallLimits, defeff, modelalias
+from app.config import Cfg, EFFORTS, MODEL_ALIASES, MODELS, SYSTEM, defeff, modelalias
 from app.errors import autherr, err, errpayload
 from app.format import BASELEAD, fmtcanon, fmtlead, gen, split
 from app.images import ImgErr, Tmpimgs
@@ -58,6 +58,41 @@ def _system(extra: str | None) -> str:
     return f"{SYSTEM}\n\nAdditional instructions:\n{extra.strip()}"
 
 
+def _toolsystem(
+    extra: str | None,
+    *,
+    topts: dict[str, dict[str, Any]],
+    tchoice: Any,
+    max_calls: int | None,
+) -> str:
+    lines: list[str] = []
+
+    if isinstance(max_calls, int):
+        if max_calls <= 0:
+            lines.append("Do not call any tools.")
+        else:
+            lines.append(f"You may call tools at most {max_calls} times in this response.")
+
+    if tchoice == "none":
+        lines.append("Do not call any tools.")
+    elif tchoice == "required":
+        lines.append("Call at least one tool before giving a final answer.")
+    elif isinstance(tchoice, dict):
+        forced = tchoice.get("type")
+        if isinstance(forced, str) and forced.strip():
+            lines.append(f"If you call a tool, use the '{forced.strip()}' tool.")
+
+    if topts:
+        lines.append(f"Client-declared tools: {', '.join(sorted(topts.keys()))}.")
+
+    if not lines:
+        return _system(extra)
+
+    pre = f"{extra.strip()}\n\n" if isinstance(extra, str) and extra.strip() else ""
+    body = pre + "Tool constraints:\n" + "\n".join(f"- {line}" for line in lines)
+    return _system(body)
+
+
 def mkapp(
     cfg: Cfg | None = None,
     codex: Any | None = None,
@@ -66,7 +101,7 @@ def mkapp(
     db_path: Path | None = None,
     admin_key: str | None = None,
     default_effort: str | None = None,
-    tool_limits: ToolCallLimits | None = None,
+    max_bad_tool_turns: int | None = None,
 ) -> FastAPI:
     cfg = cfg or Cfg.env()
     codex = codex or Codex(bin=cfg.bin, cwd=cfg.cwd, timeout=cfg.timeout)
@@ -84,7 +119,15 @@ def mkapp(
     if deff not in EFFORTS:
         raise RuntimeError(f"BARTER_DEFAULT_EFFORT must be one of: {', '.join(EFFORTS)}")
 
-    limits = tool_limits or ToolCallLimits.env()
+    max_bad_turns = max_bad_tool_turns
+    if max_bad_turns is None:
+        raw = (os.getenv("BARTER_TOOL_CALL_MAX_BAD_TURNS", "8") or "").strip()
+        try:
+            max_bad_turns = int(raw)
+        except ValueError:
+            max_bad_turns = 8
+    if max_bad_turns < 0:
+        max_bad_turns = 0
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -94,7 +137,7 @@ def mkapp(
     app.state.keydb = keydb
     app.state.admin = admin
     app.state.default_effort = deff
-    app.state.tool_limits = limits
+    app.state.max_bad_tool_turns = max_bad_turns
     app.state.store: dict[str, dict[str, Any]] = {}
     app.state.items: dict[str, list[dict[str, Any]]] = {}
 
@@ -469,20 +512,37 @@ def mkapp(
         except ValueError as exc:
             return err(400, f"invalid tool_choice: {exc}", param="tool_choice", code="invalid_tool_choice")
 
-        toolon = bool(topts) and tchoice != "none"
-        if toolon:
-            max_calls = request.app.state.tool_limits.max_calls_for(effort)
-            if isinstance(max_calls, int) and max_calls <= 0:
-                forced = tchoice.get("type") if isinstance(tchoice, dict) else None
-                if tchoice == "required" or forced:
-                    return err(
-                        400,
-                        "tool use is required but tool-call limit is 0",
-                        param="tool_choice",
-                        code="tool_budget_exceeded",
-                    )
-                toolon = False
-        sysm = _system(body.instructions)
+        max_calls = body.max_tool_calls
+        if max_calls is not None and max_calls < 0:
+            return err(
+                400,
+                "max_tool_calls must be >= 0",
+                param="max_tool_calls",
+                code="invalid_parameter",
+            )
+
+        forced = tchoice.get("type") if isinstance(tchoice, dict) else None
+        if isinstance(max_calls, int) and max_calls <= 0 and (tchoice == "required" or forced):
+            return err(
+                400,
+                "tool use is required but max_tool_calls is 0",
+                param="max_tool_calls",
+                code="tool_budget_exceeded",
+            )
+
+        # Proxy-managed tools intentionally exclude web_search; native Codex search is always enabled.
+        local_topts = {k: v for k, v in topts.items() if k != "web_search"}
+        local_tchoice: Any = tchoice
+        if isinstance(local_tchoice, dict) and local_tchoice.get("type") == "web_search":
+            local_tchoice = "none"
+        if local_tchoice == "required" and not local_topts:
+            local_tchoice = "none"
+
+        toolon = bool(local_topts) and local_tchoice != "none"
+        if isinstance(max_calls, int) and max_calls <= 0:
+            toolon = False
+
+        sysm = _toolsystem(body.instructions, topts=topts, tchoice=tchoice, max_calls=max_calls)
 
         fmt: dict[str, Any] | None = None
         fraw: Any | None = None
@@ -520,9 +580,9 @@ def mkapp(
                 msgs2 = list(msgs)
                 outs: list[dict[str, Any]] = []
                 called = 0
-                forced = tchoice.get("type") if isinstance(tchoice, dict) else None
-                forcedsrv = tchoice.get("server_label") if isinstance(tchoice, dict) else None
-                forcedmcp = tchoice.get("name") if isinstance(tchoice, dict) else None
+                forced = local_tchoice.get("type") if isinstance(local_tchoice, dict) else None
+                forcedsrv = local_tchoice.get("server_label") if isinstance(local_tchoice, dict) else None
+                forcedmcp = local_tchoice.get("name") if isinstance(local_tchoice, dict) else None
                 seq = 0
 
                 def ev(typ: str, payload: dict[str, Any]) -> str:
@@ -542,6 +602,7 @@ def mkapp(
                         "incomplete_details": None,
                         "instructions": body.instructions,
                         "max_output_tokens": body.max_output_tokens,
+                        "max_tool_calls": body.max_tool_calls,
                         "model": body.model,
                         "output": [],
                         "output_text": "",
@@ -556,7 +617,7 @@ def mkapp(
                     yield ev("response.created", {"response": base})
                     yield ev("response.in_progress", {"response": base})
 
-                    mcp = topts.get("mcp") if isinstance(topts.get("mcp"), dict) else None
+                    mcp = local_topts.get("mcp") if isinstance(local_topts.get("mcp"), dict) else None
                     if mcp and isinstance(mcp.get("servers"), dict):
                         for label, srv in sorted(mcp["servers"].items()):
                             if not isinstance(srv, dict):
@@ -609,22 +670,21 @@ def mkapp(
                                 {"response_id": rid, "output_index": outidx, "item": item},
                             )
 
-                    max_calls = request.app.state.tool_limits.max_calls_for(effort)
                     bad_turns = 0
                     while True:
                         if max_calls is not None and called >= max_calls:
                             break
-                        if bad_turns >= request.app.state.tool_limits.max_bad_tool_turns:
+                        if bad_turns >= request.app.state.max_bad_tool_turns:
                             break
 
-                        lead = actlead(topts, tchoice)
+                        lead = actlead(local_topts, local_tchoice)
                         prompt, paths = await mkprompt(msgs2, system=sysm, imgs=imgs, lead=lead)
                         res = await cdx.run(Call(model=body.model, prompt=prompt, imgs=paths, effort=effort))
                         use = useadd(use, res.usage)
 
                         typ, name, args, finaltxt = actparse(res.text)
                         if typ == "final":
-                            if (tchoice == "required" or forced) and called == 0:
+                            if (local_tchoice == "required" or forced) and called == 0:
                                 msgs2.append(
                                     Msg(
                                         role="user",
@@ -639,7 +699,7 @@ def mkapp(
                             msgs2.append(Msg(role="user", content="Tool name missing."))
                             bad_turns += 1
                             continue
-                        if name not in topts:
+                        if name not in local_topts:
                             msgs2.append(Msg(role="user", content=f"Tool '{name}' is not enabled."))
                             bad_turns += 1
                             continue
@@ -664,26 +724,12 @@ def mkapp(
                             continue
 
                         outidx = len(outs)
-                        tid = f"{('ws' if name == 'web_search' else 'ci' if name == 'code_interpreter' else 'mcp')}_{uuid4().hex}"
+                        tid = f"{('ci' if name == 'code_interpreter' else 'mcp')}_{uuid4().hex}"
                         start: dict[str, Any] = {
                             "id": tid,
-                            "type": (
-                                "web_search_call"
-                                if name == "web_search"
-                                else "code_interpreter_call"
-                                if name == "code_interpreter"
-                                else "mcp_call"
-                            ),
+                            "type": "code_interpreter_call" if name == "code_interpreter" else "mcp_call",
                             "status": "in_progress",
                         }
-                        if name == "web_search":
-                            q = (args or {}).get("query") or (args or {}).get("q") or ""
-                            start["query"] = q if isinstance(q, str) else str(q)
-                            start["action"] = {
-                                "type": "search",
-                                "query": start["query"],
-                                "queries": [start["query"]],
-                            }
                         if name == "code_interpreter":
                             c = (args or {}).get("code") or (args or {}).get("python") or ""
                             start["code"] = c if isinstance(c, str) else str(c)
@@ -708,16 +754,7 @@ def mkapp(
 
                         yield ev("response.output_item.added", {"response_id": rid, "output_index": outidx, "item": start})
 
-                        if name == "web_search":
-                            yield ev(
-                                "response.web_search_call.in_progress",
-                                {"response_id": rid, "output_index": outidx, "item_id": tid},
-                            )
-                            yield ev(
-                                "response.web_search_call.searching",
-                                {"response_id": rid, "output_index": outidx, "item_id": tid},
-                            )
-                        elif name == "code_interpreter":
+                        if name == "code_interpreter":
                             yield ev(
                                 "response.code_interpreter_call.in_progress",
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
@@ -727,18 +764,13 @@ def mkapp(
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
                             )
 
-                        item, msg = await dotool(t, name, args or {}, topts, tid=tid)
+                        item, msg = await dotool(t, name, args or {}, local_topts, tid=tid)
                         outs.append(item)
                         msgs2.append(msg)
                         called += 1
                         bad_turns = 0
 
-                        if name == "web_search":
-                            yield ev(
-                                "response.web_search_call.completed",
-                                {"response_id": rid, "output_index": outidx, "item_id": tid},
-                            )
-                        elif name == "code_interpreter":
+                        if name == "code_interpreter":
                             yield ev(
                                 "response.code_interpreter_call.completed",
                                 {"response_id": rid, "output_index": outidx, "item_id": tid},
@@ -816,6 +848,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="completed",
                         outs=outs,
                         tools=tdefs,
@@ -855,6 +888,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="failed",
                         outs=outs,
                         tools=tdefs,
@@ -876,6 +910,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="failed",
                         outs=outs,
                         tools=tdefs,
@@ -897,6 +932,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="failed",
                         outs=outs,
                         tools=tdefs,
@@ -946,6 +982,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="in_progress",
                         tools=tdefs,
                         tool_choice=tchoice,
@@ -992,6 +1029,7 @@ def mkapp(
                             instr=body.instructions,
                             meta=body.metadata,
                             maxout=body.max_output_tokens,
+                            max_tool_calls=body.max_tool_calls,
                             status="completed",
                             tools=tdefs,
                             tool_choice=tchoice,
@@ -1050,6 +1088,7 @@ def mkapp(
                                 instr=body.instructions,
                                 meta=body.metadata,
                                 maxout=body.max_output_tokens,
+                                max_tool_calls=body.max_tool_calls,
                                 status="completed",
                                 tools=tdefs,
                                 tool_choice=tchoice,
@@ -1088,6 +1127,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="failed",
                         tools=tdefs,
                         tool_choice=tchoice,
@@ -1108,6 +1148,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="failed",
                         tools=tdefs,
                         tool_choice=tchoice,
@@ -1128,6 +1169,7 @@ def mkapp(
                         instr=body.instructions,
                         meta=body.metadata,
                         maxout=body.max_output_tokens,
+                        max_tool_calls=body.max_tool_calls,
                         status="failed",
                         tools=tdefs,
                         tool_choice=tchoice,
@@ -1155,13 +1197,13 @@ def mkapp(
             msgs2 = list(msgs)
             outs: list[dict[str, Any]] = []
             called = 0
-            forced = tchoice.get("type") if isinstance(tchoice, dict) else None
-            forcedsrv = tchoice.get("server_label") if isinstance(tchoice, dict) else None
-            forcedmcp = tchoice.get("name") if isinstance(tchoice, dict) else None
+            forced = local_tchoice.get("type") if isinstance(local_tchoice, dict) else None
+            forcedsrv = local_tchoice.get("server_label") if isinstance(local_tchoice, dict) else None
+            forcedmcp = local_tchoice.get("name") if isinstance(local_tchoice, dict) else None
             use: Usage | None = None
 
             try:
-                mcp = topts.get("mcp") if isinstance(topts.get("mcp"), dict) else None
+                mcp = local_topts.get("mcp") if isinstance(local_topts.get("mcp"), dict) else None
                 if mcp and isinstance(mcp.get("servers"), dict):
                     for label, srv in sorted(mcp["servers"].items()):
                         if not isinstance(srv, dict):
@@ -1198,28 +1240,27 @@ def mkapp(
                             item = {"id": tid, "type": "mcp_list_tools", "server_label": label, "tools": [], "error": str(exc)}
                         outs.append(item)
 
-                max_calls = request.app.state.tool_limits.max_calls_for(effort)
                 bad_turns = 0
                 while True:
                     if max_calls is not None and called >= max_calls:
                         break
-                    if bad_turns >= request.app.state.tool_limits.max_bad_tool_turns:
+                    if bad_turns >= request.app.state.max_bad_tool_turns:
                         break
 
-                    lead = actlead(topts, tchoice)
+                    lead = actlead(local_topts, local_tchoice)
                     prompt, paths = await mkprompt(msgs2, system=sysm, imgs=imgs, lead=lead)
                     res: Result = await cdx.run(Call(model=body.model, prompt=prompt, imgs=paths, effort=effort))
                     use = useadd(use, res.usage)
 
                     typ, name, args, finaltxt = actparse(res.text)
                     if typ == "final":
-                        if (tchoice == "required" or forced) and called == 0:
+                        if (local_tchoice == "required" or forced) and called == 0:
                             msgs2.append(Msg(role="user", content="Tool use is required. Call a tool before finishing."))
                             bad_turns += 1
                             continue
                         break
 
-                    if not name or name not in topts:
+                    if not name or name not in local_topts:
                         msgs2.append(Msg(role="user", content=f"Tool '{name or ''}' is not enabled."))
                         bad_turns += 1
                         continue
@@ -1243,7 +1284,7 @@ def mkapp(
                             bad_turns += 1
                             continue
 
-                    item, msg = await dotool(t, name, args or {}, topts)
+                    item, msg = await dotool(t, name, args or {}, local_topts)
                     outs.append(item)
                     msgs2.append(msg)
                     called += 1
@@ -1269,6 +1310,7 @@ def mkapp(
                     instr=body.instructions,
                     meta=body.metadata,
                     maxout=body.max_output_tokens,
+                    max_tool_calls=body.max_tool_calls,
                     status="completed",
                     outs=outs,
                     tools=tdefs,
@@ -1329,6 +1371,7 @@ def mkapp(
             instr=body.instructions,
             meta=body.metadata,
             maxout=body.max_output_tokens,
+            max_tool_calls=body.max_tool_calls,
             status="completed",
             tools=tdefs,
             tool_choice=tchoice,
