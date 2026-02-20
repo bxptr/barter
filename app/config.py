@@ -13,6 +13,10 @@ MODELS = [
     "gpt-5.1-codex-mini",
 ]
 
+MODEL_ALIASES = {
+    "fast": "gpt-5.3-codex-spark",
+}
+
 EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"]
 
 SYSTEM = "You are a general-purpose, helpful AI assistant"
@@ -113,3 +117,8 @@ def defeff(raw: str | None, *, default: str | None = None) -> str | None:
     if not val or val == "none":
         return None
     return val
+
+
+def modelalias(raw: str) -> str:
+    val = raw.strip()
+    return MODEL_ALIASES.get(val, val)

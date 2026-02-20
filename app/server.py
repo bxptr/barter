@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.actions import actlead, actparse, dotool, toolchoice, toolset, useadd
 from app.auth import bearer
 from app.codex import Call, Codex, CodexError, Result, Usage
-from app.config import Cfg, EFFORTS, MODELS, SYSTEM, ToolCallLimits, defeff
+from app.config import Cfg, EFFORTS, MODEL_ALIASES, MODELS, SYSTEM, ToolCallLimits, defeff, modelalias
 from app.errors import autherr, err, errpayload
 from app.format import BASELEAD, fmtcanon, fmtlead, gen, split
 from app.images import ImgErr, Tmpimgs
@@ -30,9 +30,10 @@ from app.tools import Tools
 def chkmodel(model: str) -> JSONResponse | None:
     if model in MODELS:
         return None
+    allowed = [*MODELS, *MODEL_ALIASES.keys()]
     return err(
         400,
-        f"unsupported model '{model}'. allowed: {', '.join(MODELS)}",
+        f"unsupported model '{model}'. allowed: {', '.join(allowed)}",
         param="model",
         code="model_not_supported",
     )
@@ -203,6 +204,7 @@ def mkapp(
     @app.post("/chat/completions")
     async def chat(body: Chatreq, request: Request):
         cdx = request.app.state.codex
+        body.model = modelalias(body.model)
 
         bad = chkmodel(body.model)
         if bad:
@@ -424,6 +426,7 @@ def mkapp(
     @app.post("/responses")
     async def responses(body: Respreq, request: Request):
         cdx = request.app.state.codex
+        body.model = modelalias(body.model)
 
         bad = chkmodel(body.model)
         if bad:
@@ -1349,6 +1352,7 @@ def mkapp(
 
         model = body.get("model")
         model = model.strip() if isinstance(model, str) and model.strip() else MODELS[0]
+        model = modelalias(model)
         bad = chkmodel(model)
         if bad:
             return bad
@@ -1397,7 +1401,7 @@ def mkapp(
         model = body.get("model")
         if not isinstance(model, str) or not model.strip():
             return err(400, "model is required", param="model", code="missing_required_parameter")
-        model = model.strip()
+        model = modelalias(model)
         bad = chkmodel(model)
         if bad:
             return bad
